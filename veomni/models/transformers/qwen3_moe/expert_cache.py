@@ -66,25 +66,29 @@ def add_cache_aux_loss(loss: torch.Tensor) -> None:
 
 
 class MoEExpertCache:
-    """Per-layer, per-sample expert cache with LRU updates."""
+    """Per-layer, per-token expert cache with LRU updates."""
 
-    def __init__(self, num_layers: int, batch_size: int, budget: int, device: torch.device):
+    def __init__(self, num_layers: int, batch_size: int, sequence_length: int, budget: int, device: torch.device):
         self.num_layers = num_layers
         self.batch_size = batch_size
+        self.sequence_length = sequence_length
         self.budget = budget
         self.device = device
 
         self._cache: List[torch.Tensor] = [
-            torch.full((batch_size, budget), -1, dtype=torch.long, device=device) for _ in range(num_layers)
+            torch.full((batch_size, sequence_length, budget), -1, dtype=torch.long, device=device)
+            for _ in range(num_layers)
         ]
         self._age: List[torch.Tensor] = [
-            torch.full((batch_size, budget), -1, dtype=torch.long, device=device) for _ in range(num_layers)
+            torch.full((batch_size, sequence_length, budget), -1, dtype=torch.long, device=device)
+            for _ in range(num_layers)
         ]
         self._tick: List[torch.Tensor] = [
-            torch.zeros((batch_size,), dtype=torch.long, device=device) for _ in range(num_layers)
+            torch.zeros((batch_size, sequence_length), dtype=torch.long, device=device) for _ in range(num_layers)
         ]
         self.ema_scale: List[torch.Tensor] = [
-            torch.full((batch_size,), float("inf"), dtype=torch.float, device=device) for _ in range(num_layers)
+            torch.full((batch_size, sequence_length), float("inf"), dtype=torch.float, device=device)
+            for _ in range(num_layers)
         ]
 
     def reset(self) -> None:
@@ -97,26 +101,40 @@ class MoEExpertCache:
     def get(self, layer_idx: int) -> torch.Tensor:
         return self._cache[layer_idx]
 
-    def get_mask(self, layer_idx: int, num_experts: int) -> torch.Tensor:
-        cache = self._cache[layer_idx]
-        mask = torch.zeros((self.batch_size, num_experts), dtype=torch.bool, device=cache.device)
+    def get_mask_tokens(
+        self,
+        layer_idx: int,
+        batch_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        cache = self._cache[layer_idx][batch_indices, token_positions]
+        mask = torch.zeros((batch_indices.shape[0], num_experts), dtype=torch.bool, device=cache.device)
         valid = cache.ge(0)
         if valid.any():
-            batch_idx, slot_idx = valid.nonzero(as_tuple=True)
-            expert_ids = cache[batch_idx, slot_idx]
-            mask[batch_idx, expert_ids] = True
+            row_idx, slot_idx = valid.nonzero(as_tuple=True)
+            expert_ids = cache[row_idx, slot_idx]
+            mask[row_idx, expert_ids] = True
         return mask
 
     def update(self, layer_idx: int, expert_ids: torch.Tensor) -> None:
         """expert_ids: [B, K]."""
         assert expert_ids.dim() == 2 and expert_ids.shape[0] == self.batch_size
         batch_indices = torch.arange(self.batch_size, device=self.device)
-        self.update_tokens(layer_idx, batch_indices, expert_ids)
+        token_positions = torch.zeros_like(batch_indices)
+        self.update_tokens(layer_idx, batch_indices, token_positions, expert_ids)
 
-    def update_tokens(self, layer_idx: int, batch_indices: torch.Tensor, expert_ids: torch.Tensor) -> None:
+    def update_tokens(
+        self,
+        layer_idx: int,
+        batch_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> None:
         """Update cache for arbitrary token rows.
 
         batch_indices: [N]
+        token_positions: [N]
         expert_ids: [N, K]
         """
         cache = self._cache[layer_idx]
@@ -124,13 +142,14 @@ class MoEExpertCache:
         tick = self._tick[layer_idx]
 
         for row, batch_idx in enumerate(batch_indices.tolist()):
+            token_pos = int(token_positions[row].item())
             for expert_id in expert_ids[row].tolist():
                 if expert_id < 0:
                     continue
-                current_tick = int(tick[batch_idx].item()) + 1
-                tick[batch_idx] = current_tick
-                cache_row = cache[batch_idx]
-                age_row = age[batch_idx]
+                current_tick = int(tick[batch_idx, token_pos].item()) + 1
+                tick[batch_idx, token_pos] = current_tick
+                cache_row = cache[batch_idx, token_pos]
+                age_row = age[batch_idx, token_pos]
                 match = (cache_row == expert_id).nonzero(as_tuple=True)[0]
                 if match.numel() > 0:
                     age_row[match[0]] = current_tick
@@ -149,15 +168,16 @@ def cache_prior_scale(
     cache: MoEExpertCache,
     layer_idx: int,
     batch_indices: torch.Tensor,
+    token_positions: torch.Tensor,
 ) -> torch.Tensor:
     peak_to_peak = logits.amax(dim=1) - logits.amin(dim=1)
-    ema_old = cache.ema_scale[layer_idx][batch_indices]
+    ema_old = cache.ema_scale[layer_idx][batch_indices, token_positions]
     ema_new = torch.where(
         ema_old.isinf(),
         peak_to_peak.to(ema_old.dtype),
         torch.lerp(peak_to_peak.to(ema_old.dtype), ema_old, 0.95),
     )
-    cache.ema_scale[layer_idx][batch_indices] = ema_new
+    cache.ema_scale[layer_idx][batch_indices, token_positions] = ema_new
     return ema_new.to(peak_to_peak.dtype)
 
 
@@ -166,11 +186,12 @@ def cache_prior_promote(
     cache: MoEExpertCache,
     layer_idx: int,
     batch_indices: torch.Tensor,
+    token_positions: torch.Tensor,
     cache_mask: torch.Tensor,
     topk_idx: torch.Tensor,
     bias_scale: float = 0.2,
 ) -> torch.Tensor:
-    scale = bias_scale * cache_prior_scale(logits, cache, layer_idx, batch_indices)
+    scale = bias_scale * cache_prior_scale(logits, cache, layer_idx, batch_indices, token_positions)
     mask = cache_mask.clone()
     mask.scatter_(1, topk_idx, True)
     penalty = scale.view(-1, 1) * (~mask).to(logits.dtype)

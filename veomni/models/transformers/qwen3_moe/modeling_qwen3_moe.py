@@ -165,16 +165,22 @@ class PatchQwen3MoeTopKRouter(nn.Module):
                 cache_context.expert_cache.update_tokens(
                     layer_idx=layer_idx,
                     batch_indices=token_batch,
+                    token_positions=token_positions,
                     expert_ids=topk_idx,
                 )
                 if (~warmup_mask).any():
-                    cache_mask = cache_context.expert_cache.get_mask(layer_idx, self.num_experts)
-                    token_cache_mask = cache_mask[token_batch]
+                    token_cache_mask = cache_context.expert_cache.get_mask_tokens(
+                        layer_idx=layer_idx,
+                        batch_indices=token_batch,
+                        token_positions=token_positions,
+                        num_experts=self.num_experts,
+                    )
                     promoted_logits = cache_prior_promote(
                         logits=raw_logits[~warmup_mask],
                         cache=cache_context.expert_cache,
                         layer_idx=layer_idx,
                         batch_indices=token_batch[~warmup_mask],
+                        token_positions=token_positions[~warmup_mask],
                         cache_mask=token_cache_mask[~warmup_mask],
                         topk_idx=topk_idx[~warmup_mask],
                     )

@@ -8,8 +8,8 @@ from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-import wandb
 from tqdm import trange
+from torch.utils.tensorboard import SummaryWriter
 
 # from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.arguments import VeOmniArguments, parse_args, save_args
@@ -192,15 +192,16 @@ def main():
         lr_start=args.train.lr_start,
     )
 
-    if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                settings=wandb.Settings(console="off"),
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
+    tb_writer = None
+    if args.train.global_rank == 0 and args.train.use_wandb:
+        tb_log_dir = os.path.join(args.train.output_dir, "tensorboard")
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        tb_writer.add_text(
+            "config",
+            json.dumps({**vars(args.model), **vars(args.data), **vars(args.train)}, indent=2),
+        )
 
+    if args.train.global_rank == 0:
         # save model_assets before training
         model_assets = [model_config, tokenizer if args.data.data_type == "plaintext" else chat_template]
         save_model_assets(args.train.model_assets_dir, model_assets)
@@ -321,6 +322,7 @@ def main():
                         expert_cache = MoEExpertCache(
                             num_layers=model_config.num_hidden_layers,
                             batch_size=batch_size,
+                            sequence_length=sequence_length,
                             budget=args.train.moe_expert_cache_budget,
                             device=seq_source.device,
                         )
@@ -370,11 +372,12 @@ def main():
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
-                if args.train.use_wandb:
+                if tb_writer is not None:
                     train_metrics.update(
                         {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
                     )
-                    wandb.log(train_metrics, step=global_step)
+                    for key, value in train_metrics.items():
+                        tb_writer.add_scalar(key, value, global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
@@ -437,6 +440,9 @@ def main():
 
     dist.barrier()
     dist.destroy_process_group()
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 
 if __name__ == "__main__":
