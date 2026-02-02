@@ -40,6 +40,7 @@ from ....utils.import_utils import (
     is_liger_kernel_available,
     is_transformers_version_greater_or_equal_to,
 )
+from .expert_cache import add_cache_aux_loss, cache_prior_promote, get_moe_cache_context
 
 
 if is_liger_kernel_available():
@@ -121,6 +122,21 @@ class PatchQwen3MoeExperts(nn.Module):
 
         return final_hidden_states
 
+    def compute_expert_outputs(self, hidden_states: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
+        """Compute per-expert outputs for each token.
+
+        hidden_states: [N, H]
+        expert_ids: [N, K]
+        returns: [N, K, H]
+        """
+        gate_w = self.gate_proj[expert_ids]
+        up_w = self.up_proj[expert_ids]
+        down_w = self.down_proj[expert_ids]
+        gate = torch.einsum("nkih,nh->nki", gate_w, hidden_states)
+        up = torch.einsum("nkih,nh->nki", up_w, hidden_states)
+        hidden = self.act_fn(gate) * up
+        return torch.einsum("nkih,nki->nkh", down_w, hidden)
+
 
 class PatchQwen3MoeTopKRouter(nn.Module):
     def __init__(self, config):
@@ -133,7 +149,43 @@ class PatchQwen3MoeTopKRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        raw_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_logits = raw_logits
+        cache_context = get_moe_cache_context()
+        self._cache_aux_data = None
+        if cache_context is not None:
+            layer_idx = getattr(self, "layer_idx", None)
+            if layer_idx is not None:
+                batch_size = cache_context.batch_size
+                sequence_length = cache_context.sequence_length
+                token_batch = torch.arange(batch_size, device=hidden_states.device).repeat_interleave(sequence_length)
+                token_positions = cache_context.cache_position.to(hidden_states.device).repeat(batch_size)
+                warmup_mask = token_positions < cache_context.warmup_tokens
+                topk_idx = torch.topk(raw_logits, k=cache_context.topk, dim=-1).indices
+                cache_context.expert_cache.update_tokens(
+                    layer_idx=layer_idx,
+                    batch_indices=token_batch,
+                    expert_ids=topk_idx,
+                )
+                if (~warmup_mask).any():
+                    cache_mask = cache_context.expert_cache.get_mask(layer_idx, self.num_experts)
+                    token_cache_mask = cache_mask[token_batch]
+                    promoted_logits = cache_prior_promote(
+                        logits=raw_logits[~warmup_mask],
+                        cache=cache_context.expert_cache,
+                        layer_idx=layer_idx,
+                        batch_indices=token_batch[~warmup_mask],
+                        cache_mask=token_cache_mask[~warmup_mask],
+                        topk_idx=topk_idx[~warmup_mask],
+                    )
+                    router_logits = router_logits.clone()
+                    router_logits[~warmup_mask] = promoted_logits
+                    if cache_context.aux_loss_weight > 0:
+                        self._cache_aux_data = {
+                            "raw_logits": raw_logits,
+                            "promoted_logits": promoted_logits,
+                            "warmup_mask": warmup_mask,
+                        }
         router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
@@ -162,6 +214,26 @@ class PatchQwen3MoeSparseMoeBlock(nn.Module):
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        cache_context = get_moe_cache_context()
+        aux_data = getattr(self.gate, "_cache_aux_data", None)
+        if cache_context is not None and aux_data is not None and cache_context.aux_loss_weight > 0:
+            warmup_mask = aux_data["warmup_mask"]
+            align_topk = min(cache_context.align_topk, self.experts.num_experts)
+            if align_topk > 2 and (~warmup_mask).any():
+                raw_logits = aux_data["raw_logits"][~warmup_mask]
+                promoted_logits = aux_data["promoted_logits"]
+                promoted_logits = promoted_logits.to(raw_logits.dtype)
+                raw_top_idx = torch.topk(raw_logits, k=align_topk, dim=-1).indices
+                promoted_top_idx = torch.topk(promoted_logits, k=align_topk, dim=-1).indices
+                raw_tail = raw_top_idx[:, 2:]
+                promoted_tail = promoted_top_idx[:, 2:]
+                hidden_tail = hidden_states_reshaped[~warmup_mask]
+                raw_out = self.experts.compute_expert_outputs(hidden_tail, raw_tail)
+                promoted_out = self.experts.compute_expert_outputs(hidden_tail, promoted_tail)
+                tail_loss = torch.mean((raw_out - promoted_out) ** 2, dim=(1, 2))
+                raw_probs = torch.softmax(raw_logits, dim=-1)
+                gamma = raw_probs.gather(1, raw_tail).mean(dim=1)
+                add_cache_aux_loss((tail_loss * gamma).mean() * cache_context.aux_loss_weight)
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
