@@ -25,6 +25,11 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from veomni.models.transformers.qwen3_moe.expert_cache import (
+    MoEExpertCache,
+    attach_moe_layer_indices,
+    moe_cache_context,
+)
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
 from veomni.utils.device import (
@@ -147,6 +152,8 @@ def main():
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
+    if args.train.enable_moe_expert_cache:
+        attach_moe_layer_indices(model)
 
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     model = build_parallelize_model(
@@ -300,7 +307,39 @@ def main():
                     for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    loss = model(**micro_batch, use_cache=False).loss
+                    if args.train.enable_moe_expert_cache:
+                        labels = micro_batch.get("labels")
+                        if labels is not None:
+                            labels = labels.clone()
+                            labels[:, : args.train.moe_expert_cache_warmup_tokens] = -100
+                            micro_batch["labels"] = labels
+                        input_ids = micro_batch.get("input_ids")
+                        seq_source = input_ids if input_ids is not None else labels
+                        if seq_source is None:
+                            raise ValueError("MoE expert cache requires input_ids or labels to infer batch shape.")
+                        batch_size, sequence_length = seq_source.shape[:2]
+                        expert_cache = MoEExpertCache(
+                            num_layers=model_config.num_hidden_layers,
+                            batch_size=batch_size,
+                            budget=args.train.moe_expert_cache_budget,
+                            device=seq_source.device,
+                        )
+                        cache_position = torch.arange(sequence_length, device=seq_source.device)
+                        with moe_cache_context(
+                            expert_cache=expert_cache,
+                            cache_position=cache_position,
+                            warmup_tokens=args.train.moe_expert_cache_warmup_tokens,
+                            topk=args.train.moe_expert_cache_topk,
+                            align_topk=args.train.moe_expert_cache_align_topk,
+                            aux_loss_weight=args.train.moe_expert_cache_aux_loss_weight,
+                            batch_size=batch_size,
+                            sequence_length=sequence_length,
+                        ) as cache_context:
+                            loss = model(**micro_batch, use_cache=False).loss
+                            if cache_context.aux_losses:
+                                loss = loss + torch.stack(cache_context.aux_losses).sum()
+                    else:
+                        loss = model(**micro_batch, use_cache=False).loss
 
                 loss, _ = mean_global_loss(loss, micro_batch_token_num, micro_batches_token_num)
 
