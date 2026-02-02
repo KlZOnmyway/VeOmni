@@ -446,6 +446,30 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable activation offload to CPU."},
     )
+    enable_moe_expert_cache: bool = field(
+        default=False,
+        metadata={"help": "Enable cache-aware MoE expert routing during training."},
+    )
+    moe_expert_cache_budget: int = field(
+        default=20,
+        metadata={"help": "Per-sample expert cache budget for cache-aware MoE routing."},
+    )
+    moe_expert_cache_warmup_tokens: int = field(
+        default=16,
+        metadata={"help": "Number of warmup tokens used to seed MoE expert cache with ground-truth routing."},
+    )
+    moe_expert_cache_topk: int = field(
+        default=2,
+        metadata={"help": "Top-k experts used to update the cache and to preserve local routing."},
+    )
+    moe_expert_cache_align_topk: int = field(
+        default=8,
+        metadata={"help": "Top-k experts used to align cache-promoted routing against ground-truth routing."},
+    )
+    moe_expert_cache_aux_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for cache-aware auxiliary routing alignment loss."},
+    )
     activation_gpu_limit: float = field(
         default=0.0,
         metadata={
